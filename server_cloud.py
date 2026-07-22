@@ -27,7 +27,8 @@ async def handler(websocket):
 async def main():
     # Pornim serverul pe portul 8080
     async with websockets.serve(handler, "0.0.0.0", 8080):
-        await asyncio.future()
+        print("Serverul WebSocket a pornit pe portul 8080...")
+        await asyncio.Event().wait()  # <--- Aici era problema! Aceasta este sintaxa corectă
 
 if __name__ == "__main__":
     asyncio.run(main())

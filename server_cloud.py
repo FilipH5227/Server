@@ -1,41 +1,45 @@
 import asyncio
-import websockets
-from http import HTTPStatus
+from aiohttp import web, WSMsgType
 
+# Stocăm conexiunile active
 clients = {}
 
-async def handler(websocket):
+async def websocket_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    client_type = None
     try:
-        # Primul mesaj primit indică tipul clientului: "PC" sau "PHONE"
-        client_type = await websocket.recv()
-        clients[client_type] = websocket
-        print(f"Conectat: {client_type}")
-
-        async for message in websocket:
-            if client_type == "PHONE" and "PC" in clients:
-                await clients["PC"].send(message)
-                
-    except websockets.exceptions.ConnectionClosed:
-        pass
+        # Primul mesaj primit indică tipul clientului ("PC" sau "PHONE")
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                if client_type is None:
+                    client_type = msg.data.strip()
+                    clients[client_type] = ws
+                    print(f"Conectat: {client_type}")
+                else:
+                    # Dacă telefonul trimite ceva, redirecționăm către PC
+                    if client_type == "PHONE" and "PC" in clients:
+                        await clients["PC"].send_str(msg.data)
+            elif msg.type == WSMsgType.ERROR:
+                print(f"Excepție WebSocket: {ws.exception()}")
     finally:
-        for key, val in list(clients.items()):
-            if val == websocket:
-                del clients[key]
+        if client_type and client_type in clients:
+            del clients[client_type]
+            print(f"Deconectat: {client_type}")
 
-# Funcție care răspunde cererilor HTTP normale (browser / Render health check)
-async def process_request(connection, request):
-    if "Upgrade" not in request.headers or request.headers["Upgrade"].lower() != "websocket":
-        return connection.respond(HTTPStatus.OK, "Serverul WebSocket este ONLINE!\n")
+    return ws
 
-async def main():
-    async with websockets.serve(
-        handler, 
-        "0.0.0.0", 
-        8080, 
-        process_request=process_request
-    ):
-        print("Serverul WebSocket a pornit pe portul 8080...")
-        await asyncio.Event().wait()
+async def http_handler(request):
+    # Răspuns curat pentru orice cerere HTTP simplă din browser sau Render Health Check
+    return web.Response(text="Serverul WebSocket este ONLINE!")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+def make_app():
+    app = web.Application()
+    app.router.add_get('/', http_handler)
+    app.router.add_get('/ws', websocket_handler)
+    return app
+
+if __name__ == '__main__':
+    app = make_app()
+    web.run_app(app, host='0.0.0.0', port=8080)

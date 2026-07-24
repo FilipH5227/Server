@@ -2,28 +2,27 @@ import asyncio
 import json
 import os
 import sqlite3
-import psycopg2
 
-# Citim URL-ul bazei de date din cloud (dacă există)
+# Suport opțional pentru PostgreSQL (Neon/Supabase)
 DATABASE_URL = os.environ.get("DATABASE_URL")
+if DATABASE_URL:
+    try:
+        import psycopg2
+    except ImportError:
+        psycopg2 = None
 
 def get_db_connection():
-    """Conectează la PostgreSQL în cloud dacă există, altfel la SQLite local."""
-    if DATABASE_URL:
-        # Folosește baza de date permanentă din cloud
+    if DATABASE_URL and psycopg2:
         return psycopg2.connect(DATABASE_URL, sslmode='require')
     else:
-        # Fallback local SQLite
         conn = sqlite3.connect("deskguard.db")
         conn.row_factory = sqlite3.Row
         return conn
 
 def init_db():
-    """Creează tabelul de utilizatori dacă nu există."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    if DATABASE_URL:
+    if DATABASE_URL and psycopg2:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -39,46 +38,41 @@ def init_db():
                 password TEXT NOT NULL
             );
         """)
-        
     conn.commit()
     conn.close()
 
-# Inițializăm baza de date
 init_db()
 
 def register_user(username, password):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        if DATABASE_URL:
+        if DATABASE_URL and psycopg2:
             cursor.execute("INSERT INTO users (username, password) VALUES (%s, %s);", (username, password))
         else:
             cursor.execute("INSERT INTO users (username, password) VALUES (?, ?);", (username, password))
-            
         conn.commit()
         conn.close()
         return True, "Account created successfully!"
-    except Exception as e:
+    except Exception:
         return False, "Username already exists or database error."
 
 def login_user(username, password):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    if DATABASE_URL:
-        cursor.execute("SELECT * FROM users WHERE username = %s AND password = %s;", (username, password))
-    else:
-        cursor.execute("SELECT * FROM users WHERE username = ? AND password = ?;", (username, password))
-        
-    user = cursor.fetchone()
-    conn.close()
-    
-    if user:
-        return True, "Login successful!"
-    return False, "Invalid username or password."
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        if DATABASE_URL and psycopg2:
+            cursor.execute("SELECT * FROM users WHERE username = %s AND password = %s;", (username, password))
+        else:
+            cursor.execute("SELECT * FROM users WHERE username = ? AND password = ?;", (username, password))
+        user = cursor.fetchone()
+        conn.close()
+        if user:
+            return True, "Login successful!"
+        return False, "Invalid username or password."
+    except Exception as e:
+        return False, str(e)
 
-# --- LOGICĂ WEBSOCKET SERVER ---
 CONNECTED_CLIENTS = {}
 PIN_PAIRINGS = {}
 
@@ -91,50 +85,64 @@ async def handler(websocket):
             data = json.loads(message)
             msg_type = data.get("type")
 
-            # REGISTRARE
             if msg_type == "REGISTER":
                 user = data.get("username", "").strip()
                 pwd = data.get("password", "").strip()
                 success, msg = register_user(user, pwd)
                 await websocket.send(json.dumps({"type": "AUTH_RESPONSE", "success": success, "message": msg}))
 
-            # LOGIN
             elif msg_type == "LOGIN":
                 user = data.get("username", "").strip()
                 pwd = data.get("password", "").strip()
                 success, msg = login_user(user, pwd)
                 if success:
                     current_user = user
-                    role = data.get("role")
+                    role = data.get("role", "PC")
                     CONNECTED_CLIENTS[f"{user}_{role}"] = websocket
                 await websocket.send(json.dumps({"type": "AUTH_RESPONSE", "success": success, "message": msg}))
 
-            # PAIRING PIN & STREAMING
+            elif msg_type == "REGISTER_PIN":
+                user = data.get("username", "").strip()
+                pin = data.get("pin", "").strip()
+                PIN_PAIRINGS[user] = pin
+
             elif msg_type == "PAIR_MOBILE":
                 user = data.get("username", "").strip()
                 pwd = data.get("password", "").strip()
+                pin_entered = data.get("pin", "").strip()
+
                 success, msg = login_user(user, pwd)
                 if success:
+                    current_user = user
+                    role = "MOBILE"
                     CONNECTED_CLIENTS[f"{user}_MOBILE"] = websocket
-                    # Trimite confirmare conexiune mobil
-                    pc_socket = CONNECTED_CLIENTS.get(f"{user}_PC")
-                    if pc_socket:
-                        await pc_socket.send(json.dumps({"type": "MOBILE_CONNECTED"}))
-                    await websocket.send(json.dumps({"type": "PAIR_SUCCESS"}))
+                    
+                    saved_pin = PIN_PAIRINGS.get(user)
+                    if pin_entered == "AUTO" or pin_entered == saved_pin:
+                        await websocket.send(json.dumps({"type": "PAIR_SUCCESS"}))
+                        
+                        pc_socket = CONNECTED_CLIENTS.get(f"{user}_PC")
+                        if pc_socket:
+                            await pc_socket.send(json.dumps({"type": "MOBILE_CONNECTED"}))
+                    else:
+                        await websocket.send(json.dumps({"type": "PAIR_FAILED", "message": "Incorrect PIN code."}))
                 else:
                     await websocket.send(json.dumps({"type": "PAIR_FAILED", "message": msg}))
 
             elif msg_type == "stream":
-                # Redirecționează stream-ul de la PC la Mobile
                 mobile_socket = CONNECTED_CLIENTS.get(f"{current_user}_MOBILE")
                 if mobile_socket:
                     await mobile_socket.send(json.dumps(data))
 
             elif msg_type == "command":
-                # Trimite comanda de la Mobile la PC
                 pc_socket = CONNECTED_CLIENTS.get(f"{current_user}_PC")
                 if pc_socket:
                     await pc_socket.send(json.dumps(data))
+
+            elif msg_type == "FORCE_UPDATE_UI":
+                pc_socket = CONNECTED_CLIENTS.get(f"{current_user}_PC")
+                if pc_socket:
+                    await pc_socket.send(json.dumps({"type": "MOBILE_CONNECTED"}))
 
     except Exception:
         pass
@@ -148,5 +156,4 @@ async def main():
         await asyncio.Future()
 
 if __name__ == "__main__":
-    import websockets
     asyncio.run(main())
